@@ -32,9 +32,17 @@ public class RemoteAPI {
             String enable_remote_api_val = DBTools.selectSettingValue("enable_remote_api");
             if (enable_remote_api_val != null) {
                 enabled = enable_remote_api_val.equals("yes");
+            } else {
+                // Default to enabled on first run and persist the setting
+                enabled = true;
+                DBTools.insertSettingValue("enable_remote_api", "yes");
             }
 
             String remote_api_p = DBTools.selectSettingValue("remote_api_port");
+            if (remote_api_p == null) {
+                remote_api_p = String.valueOf(MainPanel.DEFAULT_REMOTE_API_PORT);
+                DBTools.insertSettingValue("remote_api_port", remote_api_p);
+            }
             port = Integer.parseInt(remote_api_p);
 
             // do not start if not enabled or port is 0
@@ -45,6 +53,18 @@ public class RemoteAPI {
         }
 
         Gson gson = new Gson();
+
+        // CORS headers for local development
+        before((req, res) -> {
+            res.header("Access-Control-Allow-Origin", "*");
+            res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+            res.header("Access-Control-Allow-Headers", "Content-Type");
+        });
+
+        options("/*", (req, res) -> {
+            res.status(200);
+            return "";
+        });
 
         get("/status", (req, res) -> {
             res.type("application/json");
