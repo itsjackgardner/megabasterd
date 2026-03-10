@@ -40,6 +40,9 @@ public class DBTools {
             stat.executeUpdate("CREATE TABLE IF NOT EXISTS mega_sessions(email TEXT, ma BLOB, crypt INT, PRIMARY KEY('email'));");
             stat.executeUpdate("CREATE TABLE IF NOT EXISTS downloads_queue(url TEXT, createdAt BIG INT, PRIMARY KEY('url'));");
             stat.executeUpdate("CREATE TABLE IF NOT EXISTS uploads_queue(filename TEXT, PRIMARY KEY('filename'));");
+
+            // Migrate existing tables that may be missing newer columns
+            addColumnIfMissing(stat, "downloads", "createdAt", "BIG INT");
         }
     }
 
@@ -651,6 +654,23 @@ public class DBTools {
         try (Connection conn = SqliteSingleton.getInstance().getConn(); Statement stat = conn.createStatement()) {
 
             stat.execute("DELETE FROM elc_accounts");
+        }
+    }
+
+    private static boolean hasColumn(Statement stat, String table, String column) throws SQLException {
+        try (ResultSet rs = stat.executeQuery("PRAGMA table_info(" + table + ")")) {
+            while (rs.next()) {
+                if (column.equals(rs.getString("name"))) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static void addColumnIfMissing(Statement stat, String table, String column, String type) throws SQLException {
+        if (!hasColumn(stat, table, column)) {
+            stat.executeUpdate("ALTER TABLE " + table + " ADD COLUMN " + column + " " + type);
         }
     }
 
