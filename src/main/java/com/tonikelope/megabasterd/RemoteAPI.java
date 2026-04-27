@@ -7,6 +7,8 @@ import java.io.IOException;
 import java.nio.file.*;
 import java.util.*;
 import java.util.List;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -24,6 +26,23 @@ public class RemoteAPI {
     private final MegaAPI ma = new MegaAPI();
     public boolean enabled = false;
     public int port = 0;
+
+    // Pending queue for async /start: raw URLs awaiting resolution
+    private final ConcurrentLinkedQueue<PendingSubmission> _pending_queue = new ConcurrentLinkedQueue<>();
+
+    // Track sourceUrl for folder-split downloads: per-file URL -> original folder URL
+    private final ConcurrentHashMap<String, String> _source_url_map = new ConcurrentHashMap<>();
+
+    private static class PendingSubmission {
+        final String url;
+        final String downloadPath;
+
+        PendingSubmission(String url, String downloadPath) {
+            this.url = url;
+            this.downloadPath = downloadPath;
+        }
+    }
+
     public RemoteAPI(MainPanel main_panel) {
         _main_panel = main_panel;
         _download_manager = _main_panel.getDownload_manager();
@@ -52,6 +71,11 @@ public class RemoteAPI {
             LOG.log(Level.SEVERE, "Unable to start remote api server.", ex.getMessage());
         }
 
+        // Start background thread to process pending submissions
+        Thread processorThread = new Thread(this::_processPendingQueue, "RemoteAPI-PendingProcessor");
+        processorThread.setDaemon(true);
+        processorThread.start();
+
         Gson gson = new Gson();
 
         // CORS headers for local development
@@ -77,6 +101,25 @@ public class RemoteAPI {
 
             // get downloads
             ArrayList<Map<String, Object>> downloads = new ArrayList<>();
+
+            // Include pending entries
+            for (PendingSubmission pending : _pending_queue) {
+                Map<String, Object> entry = new HashMap<>();
+                entry.put("url", pending.url);
+                entry.put("name", null);
+                entry.put("path", "");
+                entry.put("bytesTotal", 0);
+                entry.put("bytesLoaded", 0);
+                entry.put("speed", 0);
+                entry.put("status", "Pending");
+                entry.put("finished", false);
+                entry.put("error", null);
+                entry.put("workers", 0);
+                entry.put("error509Count", 0);
+                downloads.add(entry);
+            }
+
+            // Include active/completed downloads
             for (Download dl : getDownloads()) {
                 String dlStatus = dl.getView().getStatus_label().getText();
                 boolean finished = false;
@@ -105,9 +148,17 @@ public class RemoteAPI {
                     dlStatus = "Error";
                 }
 
-                downloads.add(createDownloadStatus(dl.getUrl(), dl.getFile_name(), getDownloadPath(dl),
+                Map<String, Object> entry = createDownloadStatus(dl.getUrl(), dl.getFile_name(), getDownloadPath(dl),
                         dl.getFile_size(), dl.getProgress(), dl.getFile_size() == dl.getProgress() ? 0 : dl.getSpeed(),
-                        dlStatus, dl.getStatus_error(), finished, workers.size(), error509Count));
+                        dlStatus, dl.getStatus_error(), finished, workers.size(), error509Count);
+
+                // Add sourceUrl for folder-split downloads
+                String sourceUrl = _source_url_map.get(dl.getUrl());
+                if (sourceUrl != null) {
+                    entry.put("sourceUrl", sourceUrl);
+                }
+
+                downloads.add(entry);
             }
             status.put("downloads", downloads);
 
@@ -157,11 +208,12 @@ public class RemoteAPI {
                 }
 
                 String linksText = jsonBody.get("urls").getAsString();
-                Set<String> urls = parseUrls(linksText);
+                // Extract raw URLs without resolving folders
+                List<String> rawUrls = extractRawUrls(linksText);
 
-                if (urls.isEmpty()) {
+                if (rawUrls.isEmpty()) {
                     res.status(400); // Bad Request
-                    return gson.toJson(new ErrorResponse("No mega files links found. Note: folder links not supported"));
+                    return gson.toJson(new ErrorResponse("No mega links found."));
                 }
 
                 String downloadPath = _main_panel.getDefault_download_path();
@@ -171,17 +223,18 @@ public class RemoteAPI {
                     if(!path.exists()) path.mkdirs();
                 }
 
-                // add urls
-                for (String url : urls) {
-                    Download download = new Download(
-                            _main_panel, ma, url, downloadPath,
-                            null, null, null, null, null, _main_panel.isUse_slots_down(),
-                            false, _main_panel.isUse_custom_chunks_dir() ? _main_panel.getCustom_chunks_dir() : null,false);
-                    _download_manager.getTransference_provision_queue().add(download);
-                    _download_manager.secureNotify();
+                // Queue URLs for async processing
+                for (String url : rawUrls) {
+                    _pending_queue.add(new PendingSubmission(url, downloadPath));
                 }
 
-                return "{\"message\": \""+urls.size()+" Downloads Started, "+urls.toString()+"\"}";
+                LOG.log(Level.INFO, "Queued {0} URLs for async processing", rawUrls.size());
+
+                ObjectMapper mapper = new ObjectMapper();
+                Map<String, Object> response = new HashMap<>();
+                response.put("message", rawUrls.size() + " links queued");
+                response.put("urls", rawUrls);
+                return mapper.writeValueAsString(response);
             } catch (Exception ex){
                 res.status(500);
                 return "{\"message\": \""+ex.toString()+"\"}";
@@ -203,6 +256,12 @@ public class RemoteAPI {
 
                 boolean deleteFiles = false;
                 if(jsonBody.has("delete")) deleteFiles = jsonBody.get("delete").getAsBoolean();
+
+                // Also check pending queue — remove if still pending
+                boolean removedPending = _pending_queue.removeIf(p -> Objects.equals(p.url, downloadUrl));
+                if (removedPending) {
+                    return "{\"message\": \"Removed pending download\"}";
+                }
 
                 Download download = findDownloadByURL(downloadUrl);
                 if(download == null) {
@@ -226,6 +285,9 @@ public class RemoteAPI {
                     // If the close button is visible, click it
                     if (download.getView().getClose_button().isVisible()) {
                         download.getView().getClose_button().doClick();
+
+                        // Clean up sourceUrl mapping
+                        _source_url_map.remove(download.getUrl());
 
                         // delete files if delete = true, is not default and folder is empty
                         Path downloadPath = Paths.get(download.getDownload_path());
@@ -318,6 +380,55 @@ public class RemoteAPI {
         });
     }
 
+    /**
+     * Background thread: processes the pending queue — resolves folder links,
+     * creates Download objects, and adds them to the download manager.
+     */
+    private void _processPendingQueue() {
+        while (true) {
+            try {
+                PendingSubmission pending = _pending_queue.peek();
+                if (pending == null) {
+                    Thread.sleep(500);
+                    continue;
+                }
+
+                LOG.log(Level.INFO, "Processing pending URL: {0}", pending.url);
+
+                // Resolve the URL (may be a single file or a folder)
+                Set<String> resolvedUrls = parseUrls(pending.url);
+
+                boolean isFolderSplit = resolvedUrls.size() > 1 ||
+                    (resolvedUrls.size() == 1 && !resolvedUrls.iterator().next().equals(pending.url));
+
+                // Create downloads for each resolved URL
+                for (String url : resolvedUrls) {
+                    Download download = new Download(
+                            _main_panel, ma, url, pending.downloadPath,
+                            null, null, null, null, null, _main_panel.isUse_slots_down(),
+                            false, _main_panel.isUse_custom_chunks_dir() ? _main_panel.getCustom_chunks_dir() : null, false);
+                    _download_manager.getTransference_provision_queue().add(download);
+                    _download_manager.secureNotify();
+
+                    // Track sourceUrl for folder-split downloads
+                    if (isFolderSplit) {
+                        _source_url_map.put(url, pending.url);
+                    }
+                }
+
+                LOG.log(Level.INFO, "Processed pending URL: {0} -> {1} downloads", new Object[]{pending.url, resolvedUrls.size()});
+
+                // Remove from queue after successful processing
+                _pending_queue.poll();
+
+            } catch (Exception ex) {
+                LOG.log(Level.SEVERE, "Error processing pending URL", ex);
+                // Remove the failing entry to avoid infinite retry
+                _pending_queue.poll();
+            }
+        }
+    }
+
     static class ErrorResponse {
         String message;
 
@@ -360,6 +471,33 @@ public class RemoteAPI {
         } catch (IOException e) {
             return false; // Return false in case of an error
         }
+    }
+
+    /**
+     * Extract raw mega.nz URLs from text without resolving folder links.
+     * Used by /start to quickly identify URLs for queuing.
+     */
+    private List<String> extractRawUrls(String linksText) {
+        String link_data = MiscTools.extractMegaLinksFromString(linksText);
+        List<String> urls = new ArrayList<>();
+
+        // Match file links
+        Set<String> fileLinks = new HashSet(findAllRegex("(?:https?|mega)://[^\r\n]+(#[^\r\n!]*?)?![^\r\n!]+![^\\?\r\n/]+", link_data, 0));
+        urls.addAll(fileLinks);
+
+        // Match folder links (https://mega.nz/folder/id#key or https://mega.nz/#F!id!key)
+        Set<String> folderLinks = new HashSet(findAllRegex("https?://mega\\.nz/folder/[^\\s]+", link_data, 0));
+        Set<String> legacyFolderLinks = new HashSet(findAllRegex("https?://mega\\.nz/#F![^\\s]+", link_data, 0));
+
+        // Add folder links that aren't already captured as file links
+        for (String fl : folderLinks) {
+            if (!urls.contains(fl)) urls.add(fl);
+        }
+        for (String fl : legacyFolderLinks) {
+            if (!urls.contains(fl)) urls.add(fl);
+        }
+
+        return urls;
     }
 
     private Set<String> parseUrls(String linksText){
